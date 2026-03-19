@@ -1,57 +1,79 @@
-import sqlite3
-import bcrypt
 import os
+import bcrypt
+import streamlit as st
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, Float, ForeignKey
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.exc import IntegrityError
 
-DB_PATH = 'expense_tracker.db'
+try:
+    # Try to get DB URL from Streamlit secrets (for Cloud deployment)
+    DB_URL = st.secrets.get("DATABASE_URL", None)
+except Exception:
+    DB_URL = None
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
+if not DB_URL:
+    # Fallback to local env var or SQLite
+    DB_URL = os.environ.get("DATABASE_URL", "sqlite:///expense_tracker.db")
+
+# Some SQLAlchemy URIs need 'postgresql://' instead of 'postgres://'
+if DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+
+# SQLite needs multi-thread check disabled for scoped sessions in web apps often
+if DB_URL.startswith("sqlite"):
+    engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(DB_URL)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    
+    # Relationships
+    members = relationship("FamilyMember", back_populates="user", cascade="all, delete")
+    expenses = relationship("Expense", back_populates="user", cascade="all, delete")
+
+class FamilyMember(Base):
+    __tablename__ = "family_members"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    name = Column(String, nullable=False)
+    earning_status = Column(Boolean, nullable=False)
+    earnings = Column(Float, nullable=False)
+    
+    user = relationship("User", back_populates="members")
+
+class Expense(Base):
+    __tablename__ = "expenses"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    category = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    value = Column(Float, nullable=False)
+    date = Column(String, nullable=False)
+
+    user = relationship("User", back_populates="expenses")
 
 def init_db():
-    conn = get_connection()
-    c = conn.cursor()
-    # Create users table
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL
-        )
-    ''')
-    # Create family_members table
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS family_members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            earning_status BOOLEAN NOT NULL,
-            earnings REAL NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    ''')
-    # Create expenses table
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            category TEXT NOT NULL,
-            description TEXT,
-            value REAL NOT NULL,
-            date TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    ''')
-    conn.commit()
+    Base.metadata.create_all(bind=engine)
     
-    # Auto-seed the admin account with default password if it doesn't exist
-    try:
-        admin_pass = bcrypt.hashpw('admin123'.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-        c.execute('INSERT INTO users (username, password_hash) VALUES (?, ?)', ('admin', admin_pass))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass # Admin already exists
-
-    conn.close()
+    # Auto-seed admin account
+    db = SessionLocal()
+    admin = db.query(User).filter(User.username == 'admin').first()
+    if not admin:
+        admin_pass = hash_password('admin123')
+        admin_user = User(username='admin', password_hash=admin_pass)
+        db.add(admin_user)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+    db.close()
 
 def hash_password(password):
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
@@ -60,63 +82,45 @@ def verify_password(password, hashed_password):
     return bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 def create_user(username, password):
-    conn = get_connection()
-    c = conn.cursor()
+    db = SessionLocal()
     try:
-        c.execute('INSERT INTO users (username, password_hash) VALUES (?, ?)', 
-                  (username, hash_password(password)))
-        conn.commit()
+        new_user = User(username=username, password_hash=hash_password(password))
+        db.add(new_user)
+        db.commit()
         return True
-    except sqlite3.IntegrityError:
+    except IntegrityError:
+        db.rollback()
         return False
     finally:
-        conn.close()
+        db.close()
 
 def authenticate_user(username, password):
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute('SELECT id, password_hash FROM users WHERE username = ?', (username,))
-    row = c.fetchone()
-    conn.close()
+    db = SessionLocal()
+    user = db.query(User).filter(User.username == username).first()
+    db.close()
     
-    if row and verify_password(password, row[1]):
-        return {"id": row[0], "username": username}
+    if user and verify_password(password, user.password_hash):
+        return {"id": user.id, "username": user.username}
     return None
 
 def get_all_users():
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute('SELECT id, username FROM users')
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    db = SessionLocal()
+    users = db.query(User).all()
+    db.close()
+    return [(u.id, u.username) for u in users]
 
 def get_all_members():
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute('''
-        SELECT fm.id, u.username, fm.name, fm.earning_status, fm.earnings 
-        FROM family_members fm 
-        JOIN users u ON fm.user_id = u.id
-    ''')
-    rows = c.fetchall()
-    conn.close()
+    db = SessionLocal()
+    members = db.query(FamilyMember).join(User).all()
+    rows = [(m.id, m.user.username, m.name, m.earning_status, m.earnings) for m in members]
+    db.close()
     return rows
 
 def get_all_expenses():
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute('''
-        SELECT e.id, u.username, e.category, e.description, e.value, e.date 
-        FROM expenses e 
-        JOIN users u ON e.user_id = u.id
-    ''')
-    rows = c.fetchall()
-    conn.close()
+    db = SessionLocal()
+    expenses = db.query(Expense).join(User).all()
+    rows = [(e.id, e.user.username, e.category, e.description, e.value, e.date) for e in expenses]
+    db.close()
     return rows
 
-# Ensure db structure exists on load
-if not os.path.exists(DB_PATH):
-    init_db()
-else:
-    init_db()
+init_db()

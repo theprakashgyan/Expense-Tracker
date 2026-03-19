@@ -1,5 +1,5 @@
-import sqlite3
-from database import DB_PATH
+from database import SessionLocal, FamilyMember as DBFamilyMember, Expense as DBExpense
+from sqlalchemy import func
 
 class FamilyMember:
     def __init__(self, id, name, earning_status, earnings):
@@ -13,7 +13,6 @@ class FamilyMember:
             f"Name: {self.name}, Earning Status: {'Earning' if self.earning_status else 'Not Earning'}, "
             f"Earnings: {self.earnings}"
         )
-
 
 class Expense:
     def __init__(self, id, value, category, description, date):
@@ -31,59 +30,53 @@ class FamilyExpenseTracker:
     def __init__(self, user_id):
         self.user_id = user_id
 
-    def _get_connection(self):
-        return sqlite3.connect(DB_PATH)
-
     @property
     def members(self):
-        conn = self._get_connection()
-        c = conn.cursor()
-        c.execute('SELECT id, name, earning_status, earnings FROM family_members WHERE user_id = ?', (self.user_id,))
-        rows = c.fetchall()
-        conn.close()
-        return [FamilyMember(r[0], r[1], bool(r[2]), r[3]) for r in rows]
+        db = SessionLocal()
+        db_members = db.query(DBFamilyMember).filter(DBFamilyMember.user_id == self.user_id).all()
+        result = [FamilyMember(m.id, m.name, bool(m.earning_status), m.earnings) for m in db_members]
+        db.close()
+        return result
 
     @property
     def expense_list(self):
-        conn = self._get_connection()
-        c = conn.cursor()
-        c.execute('SELECT id, value, category, description, date FROM expenses WHERE user_id = ?', (self.user_id,))
-        rows = c.fetchall()
-        conn.close()
-        return [Expense(r[0], r[1], r[2], r[3], r[4]) for r in rows]
+        db = SessionLocal()
+        db_expenses = db.query(DBExpense).filter(DBExpense.user_id == self.user_id).all()
+        result = [Expense(e.id, e.value, e.category, e.description, e.date) for e in db_expenses]
+        db.close()
+        return result
 
     def add_family_member(self, name, earning_status=True, earnings=0):
         if not name.strip():
             raise ValueError("Name field cannot be empty")
-        conn = self._get_connection()
-        c = conn.cursor()
-        c.execute('INSERT INTO family_members (user_id, name, earning_status, earnings) VALUES (?, ?, ?, ?)',
-                  (self.user_id, name, earning_status, earnings))
-        conn.commit()
-        conn.close()
-    
+        db = SessionLocal()
+        new_member = DBFamilyMember(user_id=self.user_id, name=name, earning_status=earning_status, earnings=earnings)
+        db.add(new_member)
+        db.commit()
+        db.close()
+
     def delete_family_member(self, member):
-        conn = self._get_connection()
-        c = conn.cursor()
-        c.execute('DELETE FROM family_members WHERE id = ?', (member.id,))
-        conn.commit()
-        conn.close()
+        db = SessionLocal()
+        db_member = db.query(DBFamilyMember).filter(DBFamilyMember.id == member.id).first()
+        if db_member:
+            db.delete(db_member)
+            db.commit()
+        db.close()
 
     def update_family_member(self, member, earning_status=True, earnings=0):
         if member:
-            conn = self._get_connection()
-            c = conn.cursor()
-            c.execute('UPDATE family_members SET earning_status = ?, earnings = ? WHERE id = ?',
-                      (earning_status, earnings, member.id))
-            conn.commit()
-            conn.close()
+            db = SessionLocal()
+            db_member = db.query(DBFamilyMember).filter(DBFamilyMember.id == member.id).first()
+            if db_member:
+                db_member.earning_status = earning_status
+                db_member.earnings = earnings
+                db.commit()
+            db.close()
 
     def calculate_total_earnings(self):
-        conn = self._get_connection()
-        c = conn.cursor()
-        c.execute('SELECT SUM(earnings) FROM family_members WHERE user_id = ? AND earning_status = 1', (self.user_id,))
-        total = c.fetchone()[0]
-        conn.close()
+        db = SessionLocal()
+        total = db.query(func.sum(DBFamilyMember.earnings)).filter(DBFamilyMember.user_id == self.user_id, DBFamilyMember.earning_status == True).scalar()
+        db.close()
         return total if total else 0
 
     def add_expense(self, value, category, description, date):
@@ -92,19 +85,19 @@ class FamilyExpenseTracker:
         if not category.strip():
             raise ValueError("Please choose a category")
 
-        conn = self._get_connection()
-        c = conn.cursor()
-        c.execute('INSERT INTO expenses (user_id, category, description, value, date) VALUES (?, ?, ?, ?, ?)',
-                  (self.user_id, category, description, value, date))
-        conn.commit()
-        conn.close()
+        db = SessionLocal()
+        new_expense = DBExpense(user_id=self.user_id, category=category, description=description, value=value, date=date)
+        db.add(new_expense)
+        db.commit()
+        db.close()
 
     def delete_expense(self, expense):
-        conn = self._get_connection()
-        c = conn.cursor()
-        c.execute('DELETE FROM expenses WHERE id = ?', (expense.id,))
-        conn.commit()
-        conn.close()
+        db = SessionLocal()
+        db_exp = db.query(DBExpense).filter(DBExpense.id == expense.id).first()
+        if db_exp:
+            db.delete(db_exp)
+            db.commit()
+        db.close()
 
 
     def merge_similar_category(self, value, category, description, date):
@@ -113,27 +106,21 @@ class FamilyExpenseTracker:
         if not category.strip():
             raise ValueError("Please choose a category")
 
-        conn = self._get_connection()
-        c = conn.cursor()
-        c.execute('SELECT id, value, description FROM expenses WHERE user_id = ? AND category = ?', (self.user_id, category))
-        row = c.fetchone()
+        db = SessionLocal()
+        existing_exp = db.query(DBExpense).filter(DBExpense.user_id == self.user_id, DBExpense.category == category).first()
 
-        if row:
-            exp_id, existing_value, existing_desc = row
-            new_val = existing_value + value
-            new_desc = description if description else existing_desc
-            c.execute('UPDATE expenses SET value = ?, description = ? WHERE id = ?', (new_val, new_desc, exp_id))
+        if existing_exp:
+            existing_exp.value += value
+            existing_exp.description = description if description else existing_exp.description
         else:
-            c.execute('INSERT INTO expenses (user_id, category, description, value, date) VALUES (?, ?, ?, ?, ?)',
-                      (self.user_id, category, description, value, date))
+            new_expense = DBExpense(user_id=self.user_id, category=category, description=description, value=value, date=date)
+            db.add(new_expense)
             
-        conn.commit()
-        conn.close()
+        db.commit()
+        db.close()
 
     def calculate_total_expenditure(self):
-        conn = self._get_connection()
-        c = conn.cursor()
-        c.execute('SELECT SUM(value) FROM expenses WHERE user_id = ?', (self.user_id,))
-        total = c.fetchone()[0]
-        conn.close()
+        db = SessionLocal()
+        total = db.query(func.sum(DBExpense.value)).filter(DBExpense.user_id == self.user_id).scalar()
+        db.close()
         return total if total else 0
